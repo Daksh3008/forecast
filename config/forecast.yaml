@@ -1,0 +1,16 @@
+# Forecast configuration
+
+seq_len: 60
+
+paths:
+  scaler_lstm: "models/lstm_attention/scalers/feature_scaler.joblib"
+  scaler_tcn: "models/tcn/scalers/feature_scaler.joblib"
+  scaler_lgbm: "models/lightgbm/scalers/feature_scaler.joblib"
+
+  lstm_checkpoint: "models/lstm_attention/checkpoints/best.pt"
+  tcn_checkpoint: "models/tcn/checkpoints/best.pt"
+  lightgbm_checkpoint: "models/lightgbm/checkpoints/best.pkl"
+
+forecast_output:
+  csv_dir: "forecasts/results/"
+  report_dir: "forecasts/reports/"

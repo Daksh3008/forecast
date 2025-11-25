@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+env/
+venv/
+
+# Logs
+logs/
+*.log
+
+# Data
+data/raw/*
+data/interim/*
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+
+# Models
+models/**/checkpoints/*
+models/**/scalers/*
+models/**/lightgbm/*
+models/**/tcn/*
+models/**/lstm_attention/*
+
+# PyTorch
+*.pt
+*.pth
+
+# VSCode
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Reports
+forecasts/results/*
+forecasts/plots/*
+forecasts/reports/*
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,12 @@
+# TCN model training configuration
+
+input_size: null              # AUTO-DETECTED
+num_channels: [32, 64, 128, 128]
+kernel_size: 2
+dropout: 0.34
+
+batch_size: 32
+epochs: 20
+lr: 0.0044
+
+seq_len: 60

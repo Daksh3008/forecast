@@ -1,0 +1,22 @@
+# Core
+numpy==1.26.4
+pandas==2.2.1
+scikit-learn==1.4.2
+joblib==1.4.2
+
+# PyTorch (GPU supported)
+torch==2.2.1
+torchvision==0.17.1
+torchaudio==2.2.1
+
+# Models
+lightgbm==4.3.0
+optuna==3.6.1
+
+# Plots / Reports
+matplotlib==3.8.3
+seaborn==0.13.2
+
+# Utils
+PyYAML==6.0.1
+tqdm==4.66.2

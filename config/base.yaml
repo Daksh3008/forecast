@@ -1,0 +1,13 @@
+# Base configuration shared across training & forecasting
+
+random_seed: 42
+seq_len: 60
+
+paths:
+  raw_data: "data/raw/"
+  processed_data: "data/processed/"
+  models: "models/"
+  forecasts: "forecasts/"
+
+logging:
+  level: INFO
