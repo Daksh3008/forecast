@@ -55,10 +55,45 @@ Optional GPU acceleration
 4. Ensemble Model
 ensemble = (lstm + tcn + lgbm) / 3
 
-run command 
+run commands
+
+python -m scripts.prepare_data
+
+this generates:
+data/processed/X_seq.npy
+data/processed/y_seq.npy
+data/processed/X_tab.npy
+data/processed/y_tab.npy
+data/processed/feature_cols.npy
+
+
+run optuna hyperparameter optimization
+python -m scripts.optuna.optimize_lstm --trials 50
+python -m scripts.optuna.optimize_tcn --trials 50
+python -m scripts.optuna.optimize_lightgbm --trials 50
+
+models/lstm_attention/best_optuna_params.json
+models/tcn/best_optuna_params.json
+models/lightgbm/best_optuna_params.json
+
+train_all.py will automatically load these
+
+python -m scripts.train_all
+
+checkpoints saved to:
+models/lstm_attention/checkpoints/best.pt
+models/tcn/checkpoints/best.pt
+models/lightgbm/checkpoints/best.pkl
+
+
+
+forecast a future price for any date with report:
 python -m scripts.generate_report --target 2026-01-01
 change date above to whatever date you want price prediction for
-, 
+
+
+output saved to forecasts/reports/report_2026-01-01.md
+
 
 
 
