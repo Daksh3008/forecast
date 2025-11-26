@@ -277,6 +277,118 @@ def forecast_to_date(target_date: str):
         ensemble_pred = float(final_pred)
         forecast_for = tdate
 
+
+    # -------------------------
+    # Prepare additional report items: macro snapshot, tech snapshot, correlations, news
+    # -------------------------
+    # Macro snapshot: recent raw numeric columns (try to pick common names)
+    macro_snapshot = {}
+    # look for common macro columns in df_proc or df_raw
+    for k in ["brent_close", "wti_close", "dxy_close", "usd_inr", "usdinr_close", "vix_close"]:
+        if k in df_proc.columns:
+            val = df_proc[k].iloc[-1]
+            macro_snapshot[k] = f"{val:.4f}" if pd.notna(val) else "N/A"
+    # fallback: if raw df (df_raw) exists, prefer that
+    try:
+        if "df_raw" in locals():
+            for k in ["brent_close", "wti_close", "dxy_close", "usd_inr", "usdinr_close", "vix_close"]:
+                if k in df_raw.columns:
+                    macro_snapshot[k] = f"{df_raw[k].iloc[-1]:.4f}"
+    except Exception:
+        pass
+
+    # Technical snapshot: extract some canonical indicators (if present)
+    tech_snapshot = {}
+    # use feature names commonly present from build_features
+    for tk in ["brentclose_rsi_14", "brentclose_ma_10", "brentclose_ma_50", "brentclose_ma_200",
+               "close", "ind_ma10", "ind_ma50", "ind_ma200"]:
+        if tk in df_proc.columns:
+            tech_snapshot[tk] = f"{df_proc[tk].iloc[-1]:.4f}"
+
+    # If 'close' exists, compute RSI/MA using last few rows if the canonical names don't exist
+    if "close" in df_proc.columns and not any(k in tech_snapshot for k in ["ind_ma10", "ind_ma50", "ind_ma200"]):
+        try:
+            close_ser = df_proc["close"].astype(float)
+            tech_snapshot["ind_ma10"] = f"{close_ser.rolling(10, min_periods=1).mean().iloc[-1]:.4f}"
+            tech_snapshot["ind_ma50"] = f"{close_ser.rolling(50, min_periods=1).mean().iloc[-1]:.4f}"
+            tech_snapshot["ind_ma200"] = f"{close_ser.rolling(200, min_periods=1).mean().iloc[-1]:.4f}"
+        except Exception:
+            pass
+
+    # Correlations: compute pearson between each numeric feature and close (or log_close)
+    correlations = []
+    target_col_for_corr = "log_close" if "log_close" in df_proc.columns else ("close" if "close" in df_proc.columns else None)
+    if target_col_for_corr:
+        numeric_cols = df_proc.select_dtypes(include=["number"]).columns.tolist()
+        # exclude the target itself
+        if target_col_for_corr in numeric_cols:
+            numeric_cols.remove(target_col_for_corr)
+        # compute correlations
+        for col in numeric_cols:
+            try:
+                corr = df_proc[col].corr(df_proc[target_col_for_corr])
+                correlations.append((col, abs(float(corr) if not pd.isna(corr) else 0.0)))
+            except Exception:
+                continue
+        correlations = sorted(correlations, key=lambda x: x[1], reverse=True)
+
+    # News: load pre-fetched news file if available
+    news_file = Path("data/processed/news_top100.json")
+    news_top = []
+    if news_file.exists():
+        try:
+            import json
+            with open(news_file, "r", encoding="utf8") as f:
+                news_top = json.load(f)
+        except Exception:
+            news_top = []
+
+    # Compute ensemble sigma (approx): use RMSE across model preds as a proxy
+    # We can use the sample std of model predictions (in log-price space if available)
+    try:
+        # preds dict might be prices — convert back to log-space for sigma estimate
+        model_logs = []
+        for v in preds.values():
+            if v is None:
+                continue
+            try:
+                model_logs.append(np.log(float(v)))
+            except Exception:
+                pass
+        sigma = float(np.std(model_logs)) if len(model_logs) > 1 else None
+    except Exception:
+        sigma = None
+
+    # Build final report using report_builder
+    from forecast.inference.report_builder import build_markdown_report as build_report
+    additional_notes = [
+        "• Models trained on log-price targets; predictions converted to price via exp().",
+        "• News items were scored by fuzzy matching + recency; top items included below.",
+        "• Correlations are absolute Pearson correlations computed on the processed feature matrix."
+    ]
+    additional_notes = "\n".join(additional_notes)
+
+    report_out = build_report(
+        target_date=str(forecast_for),
+        preds=preds,
+        ensemble_pred=ensemble_pred,
+        sigma=sigma,
+        macro_snapshot=macro_snapshot,
+        tech_snapshot=tech_snapshot,
+        correlations=correlations,
+        news_top=news_top,
+        additional_notes=additional_notes,
+        title=f"Brent Crude Forecast (Ensemble)"
+    )
+
+    # report_out contains {'md': path, 'pdf': path or None}
+    md_path = report_out.get("md")
+    pdf_path = report_out.get("pdf")
+
+    print(f"Report saved: {md_path}  (pdf: {pdf_path})")
+
+
+
     # -------------------------
     # Save CSV & report (use config paths)
     # -------------------------
@@ -296,11 +408,29 @@ def forecast_to_date(target_date: str):
     out_df.to_csv(csv_path, index=False)
     print(f"Saved forecast CSV: {csv_path}")
 
-    md = build_markdown_report(str(forecast_for), preds, ensemble_pred)
-    md_path = report_dir / f"forecast_{forecast_for}.md"
-    with open(md_path, "w") as f:
-        f.write(md)
-    print(f"Saved report: {md_path}")
+    # build_markdown_report now returns {'md': '<path>', 'pdf': '<path or None>'}
+    report_out = build_markdown_report(
+        target_date=str(forecast_for),
+        preds=preds,
+        ensemble_pred=ensemble_pred,
+        sigma=sigma if 'sigma' in locals() else None,
+        macro_snapshot=macro_snapshot if 'macro_snapshot' in locals() else None,
+        tech_snapshot=tech_snapshot if 'tech_snapshot' in locals() else None,
+        correlations=correlations if 'correlations' in locals() else None,
+        news_top=news_top if 'news_top' in locals() else None,
+        additional_notes=additional_notes if 'additional_notes' in locals() else None,
+        title=f"Brent Crude Forecast (Ensemble)"
+    )
+
+    md_path = report_out.get("md")
+    pdf_path = report_out.get("pdf")
+
+    print(f"Saved markdown report: {md_path}")
+    if pdf_path:
+        print(f"Saved PDF report: {pdf_path}")
+    else:
+        print("PDF report not created (weasyprint/pdfkit not available).")
+
 
     return {
         "forecast_date": str(forecast_for),
