@@ -18,7 +18,10 @@ data/raw/*
 data/interim/*
 !data/raw/.gitkeep
 !data/interim/.gitkeep
-data/processed/*
+data/processed/X_seq.npy
+data/processed/y_seq.npy
+data/processed/X_tab.npy
+data/processed/y_tab.npy    
 
 # Models
 models/**/checkpoints/*
