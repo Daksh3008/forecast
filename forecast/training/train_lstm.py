@@ -1,87 +1,105 @@
-import os
+"""
+Train upgraded LSTM on log-price target (predict log_price_next).
+Saves best checkpoint (model.save()).
+Reports RMSE (root mean squared error) on validation.
+"""
+import yaml
+import numpy as np
+from pathlib import Path
 import torch
 import torch.nn as nn
-from torch.optim import Adam
-from typing import Dict
-from forecast.training.trainer_utils import create_dataloader, move_batch_to_device, compute_loss
+from torch.utils.data import DataLoader, TensorDataset
+
 from forecast.models.lstm_attention import LSTMAttentionModel
-import config
-from forecast.utils.optuna_loader import load_optuna_params
 
+CFG_PATH = Path("config/train_lstm.yaml")
+BASE_CFG = Path("config/base.yaml")
 
+def load_cfg():
+    try:
+        cfg = yaml.safe_load(CFG_PATH.read_text())
+    except Exception:
+        cfg = {}
+    try:
+        base = yaml.safe_load(BASE_CFG.read_text())
+    except Exception:
+        base = {}
+    seq_len = int(cfg.get("seq_len", base.get("seq_len", 60)))
+    return cfg, seq_len
 
+def train_lstm(save_path="models/lstm_attention/checkpoints/best.pt"):
+    cfg, seq_len = load_cfg()
+    X = np.load("data/processed/X_seq.npy")
+    y = np.load("data/processed/y_seq.npy")   # log-price next-day
 
-
-def train_lstm(
-    X_train,
-    y_train,
-    X_val,
-    y_val,
-    config: Dict,
-    save_path: str,
-):
-    optuna_path = "models/lstm_attention/best_optuna_params.json"
-    opt_params = load_optuna_params(optuna_path)
-
-    if opt_params is not None:
-        config.update(opt_params)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    input_size = X.shape[-1]
     model = LSTMAttentionModel(
-        input_size=config["input_size"],
-        hidden_size=config["hidden_size"],
-        n_layers=config["n_layers"],
-        n_heads=config["n_heads"],
-        dropout=config["dropout"],
-        bidirectional=config["bidirectional"],
-        fc_hidden=config["fc_hidden"],
-        device=device,
+        input_size=input_size,
+        hidden_size=int(cfg.get("hidden_size", 256)),
+        n_layers=int(cfg.get("n_layers", 2)),
+        n_heads=int(cfg.get("n_heads", 4)),
+        dropout=float(cfg.get("dropout", 0.1)),
+        bidirectional=bool(cfg.get("bidirectional", False)),
+        fc_hidden=int(cfg.get("fc_hidden", 128)),
+        input_proj=cfg.get("input_proj", None),
+        seq_len=seq_len,
+        predict_return=False
     ).to(device)
 
-    optimizer = Adam(model.parameters(), lr=config["lr"])
-    loss_fn = nn.MSELoss()
+    batch_size = int(cfg.get("batch_size", 32))
+    epochs = int(cfg.get("epochs", 50))
+    lr = float(cfg.get("lr", 1e-3))
 
-    train_loader = create_dataloader(X_train, y_train, batch_size=config["batch_size"])
-    val_loader = create_dataloader(X_val, y_val, batch_size=config["batch_size"], shuffle=False)
+    n = len(y)
+    split = int(n * 0.8)
+    Xtr, Xvl = X[:split], X[split:]
+    ytr, yvl = y[:split], y[split:]
 
-    best_loss = float("inf")
-    epochs = config["epochs"]
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    train_loader = DataLoader(TensorDataset(torch.tensor(Xtr, dtype=torch.float32), torch.tensor(ytr, dtype=torch.float32)), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(TensorDataset(torch.tensor(Xvl, dtype=torch.float32), torch.tensor(yvl, dtype=torch.float32)), batch_size=batch_size, shuffle=False)
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()  # we'll report RMSE derived from MSE
+
+    best_val_rmse = float("inf")
+    best_epoch = -1
 
     for epoch in range(1, epochs + 1):
         model.train()
-        train_loss = 0.0
-
-        for batch in train_loader:
-            Xb, yb = move_batch_to_device(batch, device)
-            optimizer.zero_grad()
-
+        tr_loss = 0.0
+        for Xb, yb in train_loader:
+            Xb = Xb.to(device); yb = yb.to(device)
+            opt.zero_grad()
             preds = model(Xb)
-            loss = compute_loss(preds, yb, loss_fn)
-
+            loss = loss_fn(preds, yb)
             loss.backward()
-            optimizer.step()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tr_loss += loss.item() * Xb.size(0)
+        tr_loss = (tr_loss / len(Xtr)) ** 0.5  # RMSE
 
-            train_loss += loss.item()
-
-        train_loss /= len(train_loader)
-
-        # Validation
+        # validation
         model.eval()
-        val_loss = 0.0
+        val_mse = 0.0
         with torch.no_grad():
-            for batch in val_loader:
-                Xb, yb = move_batch_to_device(batch, device)
+            for Xb, yb in val_loader:
+                Xb = Xb.to(device); yb = yb.to(device)
                 preds = model(Xb)
-                loss = compute_loss(preds, yb, loss_fn)
-                val_loss += loss.item()
-        val_loss /= len(val_loader)
+                mse = loss_fn(preds, yb).item()
+                val_mse += mse * Xb.size(0)
+        val_rmse = (val_mse / len(Xvl)) ** 0.5
 
-        print(f"Epoch {epoch}/{epochs}  Train Loss: {train_loss:.5f}  Val Loss: {val_loss:.5f}")
+        print(f"[LSTM] Epoch {epoch}/{epochs} train_rmse={tr_loss:.6f} val_rmse={val_rmse:.6f}")
 
-        if val_loss < best_loss:
-            best_loss = val_loss
-            model.save(save_path, extra={"val_loss": val_loss})
-            print(f"  ✔ Saved best model (loss={val_loss:.5f})")
+        if val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
+            best_epoch = epoch
+            model.save(save_path, extra={"val_rmse": float(best_val_rmse), "epoch": best_epoch})
+            print(f"  Saved best model at epoch {epoch} val_rmse={best_val_rmse:.6f}")
 
-    return best_loss
+    return {"best_val_rmse": best_val_rmse, "best_epoch": best_epoch}
+
+if __name__ == "__main__":
+    train_lstm()

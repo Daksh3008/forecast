@@ -1,141 +1,159 @@
 """
-LSTM + Multi-Head Attention model for single-step forecasting.
-Input: x (batch, seq_len, n_features)
-Output: y_hat (batch,) or (batch, 1)
+Upgraded LSTM + Multi-Head Attention model.
 
-GPU-ready: supply device string ("cuda" or "cpu") to constructor or call .to(device).
-Includes save/load helpers that persist model state_dict + config.
+Features:
+- Input projection
+- Positional encoding
+- Multi-layer LSTM (configurable)
+- Self-attention over time (MultiheadAttention)
+- LayerNorm and residual connections
+- MLP head with configurable fc_hidden
+- save()/load() helpers that persist model kwargs in checkpoint for reproducible loading
+- optional return-based training support (prediction can be configured to predict absolute price
+  or log-return / return).
 """
+
+from __future__ import annotations
 import math
+import json
+from typing import Optional, Dict, Any
+
 import torch
 import torch.nn as nn
-from typing import Optional, Dict
+import torch.nn.functional as F
+from pathlib import Path
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 1000):
+    def __init__(self, d_model: int, max_len: int = 5000):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
-        if d_model % 2 == 1:
-            # last odd column remains zero for cos
-            pe[:, 1::2] = torch.cos(position * div_term[:-1])
-        else:
-            pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(1)  # (max_len, 1, d_model)
-        self.register_buffer("pe", pe)  # not a parameter
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        self.register_buffer("pe", pe)
 
-    def forward(self, x: torch.Tensor):
-        # x: (seq_len, batch, d_model)
-        seq_len = x.size(0)
-        x = x + self.pe[:seq_len]
-        return x
+    def forward(self, x):
+        # x: (batch, seq_len, d_model)
+        L = x.size(1)
+        return x + self.pe[:, :L]
 
 
 class LSTMAttentionModel(nn.Module):
     def __init__(
         self,
         input_size: int,
-        hidden_size: int = 128,
+        hidden_size: int = 256,
         n_layers: int = 2,
         n_heads: int = 4,
-        attn_embed_dim: Optional[int] = None,
         dropout: float = 0.1,
         bidirectional: bool = False,
-        fc_hidden: int = 64,
+        fc_hidden: int = 128,
+        input_proj: Optional[int] = None,
+        seq_len: int = 60,
+        predict_return: bool = False,
         device: Optional[str] = None,
     ):
-        """
-        Params:
-            input_size: number of features per timestep
-            hidden_size: LSTM hidden size
-            n_layers: number of LSTM layers
-            n_heads: heads for MultiHeadAttention
-            attn_embed_dim: embedding dim for attention (defaults to hidden_size)
-            dropout: dropout between layers
-            bidirectional: if True use bidirectional LSTM
-            fc_hidden: hidden units for final MLP
-            device: "cuda" or "cpu" (optional)
-        """
         super().__init__()
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.n_layers = n_layers
-        self.bidirectional = bidirectional
-        self.num_directions = 2 if bidirectional else 1
+        self.kwargs = dict(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            dropout=dropout,
+            bidirectional=bidirectional,
+            fc_hidden=fc_hidden,
+            input_proj=input_proj,
+            seq_len=seq_len,
+            predict_return=predict_return,
+        )
 
-        self.input_projection = nn.Linear(input_size, hidden_size)
-        self.pos_encoder = PositionalEncoding(hidden_size, max_len=2048)
+        self.device = device
+        self.input_proj_dim = input_proj or hidden_size
+        # input projection
+        self.input_proj = nn.Linear(input_size, self.input_proj_dim)
 
+        # positional encoding
+        self.pos_enc = PositionalEncoding(self.input_proj_dim, max_len=seq_len)
+
+        # LSTM
         self.lstm = nn.LSTM(
-            input_size=hidden_size,
+            input_size=self.input_proj_dim,
             hidden_size=hidden_size,
             num_layers=n_layers,
-            dropout=dropout if n_layers > 1 else 0.0,
             batch_first=True,
+            dropout=dropout if n_layers > 1 else 0.0,
             bidirectional=bidirectional,
         )
 
-        attn_dim = attn_embed_dim or hidden_size
-        # If bidirectional, project to attn_dim
-        self.attn_in_proj = nn.Linear(hidden_size * self.num_directions, attn_dim)
-        self.multihead_attn = nn.MultiheadAttention(embed_dim=attn_dim, num_heads=n_heads, dropout=dropout, batch_first=False)
+        attn_dim = hidden_size * (2 if bidirectional else 1)
+        # project LSTM outputs to attn dim if needed
+        if attn_dim != self.input_proj_dim:
+            self.proj_for_attn = nn.Linear(attn_dim, self.input_proj_dim)
+        else:
+            self.proj_for_attn = nn.Identity()
 
+        # Multihead attention expects (seq_len, batch, embed_dim) or (batch, seq_len, embed_dim) with batch_first
+        self.self_attn = nn.MultiheadAttention(embed_dim=self.input_proj_dim, num_heads=n_heads, dropout=dropout, batch_first=True)
+
+        # LayerNorm + residual
+        self.ln_attn = nn.LayerNorm(self.input_proj_dim)
+        self.ln_post = nn.LayerNorm(self.input_proj_dim)
+
+        # MLP head
         self.fc = nn.Sequential(
-            nn.Linear(attn_dim, fc_hidden),
+            nn.Linear(self.input_proj_dim, fc_hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(fc_hidden, 1)
         )
 
-        self._init_weights()
+        self.dropout = nn.Dropout(dropout)
+        self.predict_return = predict_return
 
-    def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (batch, seq_len, input_size)
-        returns: (batch,) or (batch, 1)
+        returns: (batch,) scalar output
         """
-        assert x.dim() == 3
-        batch, seq_len, _ = x.shape
-        x = self.input_projection(x)  # (batch, seq_len, hidden)
-        x = x.transpose(0, 1)  # (seq_len, batch, hidden) for pos encoder & MHA
-        x = self.pos_encoder(x)  # add positional encoding
+        # input projection
+        h = self.input_proj(x)  # (batch, seq_len, d_model)
+        h = self.pos_enc(h)
+        # LSTM
+        lstm_out, _ = self.lstm(h)  # (batch, seq_len, hidden*directions)
+        attn_in = self.proj_for_attn(lstm_out)  # (batch, seq_len, d_model)
 
-        x_lstm_in = x.transpose(0, 1)  # (batch, seq_len, hidden)
-        lstm_out, _ = self.lstm(x_lstm_in)  # (batch, seq_len, hidden * num_directions)
-
-        # prepare for attention: (seq_len, batch, embed)
-        # If bidirectional, lstm_out last dim = hidden*2, else hidden
-        attn_in = self.attn_in_proj(lstm_out)  # (batch, seq_len, attn_dim)
-        attn_in = attn_in.transpose(0, 1)  # (seq_len, batch, attn_dim)
-
-        # self-attention across time
-        attn_out, attn_weights = self.multihead_attn(attn_in, attn_in, attn_in, need_weights=True)
-        # attn_out: (seq_len, batch, attn_dim). We'll pool across time (e.g., take last time or mean)
-        # Use attention-weighted pooling: take the attention output at the last time step
-        last = attn_out[-1]  # (batch, attn_dim)
-
-        out = self.fc(last).squeeze(-1)  # (batch,)
+        # Self-attention (batch_first=True)
+        attn_out, _ = self.self_attn(attn_in, attn_in, attn_in)  # (batch, seq_len, d_model)
+        # residual + norm
+        h = self.ln_attn(attn_in + self.dropout(attn_out))
+        # pooling: use last timestep + mean pooling combined
+        last = h[:, -1, :]  # (batch, d_model)
+        mean = h.mean(dim=1)
+        pooled = self.ln_post(last + mean)
+        out = self.fc(pooled).squeeze(-1)
         return out
 
-    def save(self, path: str, extra: Optional[Dict] = None):
-        state = {"model_state_dict": self.state_dict()}
-        if extra:
-            state.update(extra)
-        torch.save(state, path)
+    # -------------------------
+    # Save / Load helpers
+    # -------------------------
+    def save(self, path: str, extra: Optional[Dict[str, Any]] = None):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "model_state_dict": self.state_dict(),
+            "model_kwargs": self.kwargs,
+            "extra": extra or {}
+        }
+        torch.save(payload, path)
 
     @classmethod
-    def load(cls, path: str, map_location: Optional[str] = None, **model_kwargs):
-        map_location = map_location or ("cuda" if torch.cuda.is_available() else "cpu")
-        checkpoint = torch.load(path, map_location=map_location)
-        model = cls(**model_kwargs)
-        model.load_state_dict(checkpoint["model_state_dict"])
+    def load(cls, path: str, map_location: Optional[str] = None, **override_kwargs):
+        payload = torch.load(path, map_location=map_location)
+        saved_kwargs = payload.get("model_kwargs", {})
+        saved_kwargs.update(override_kwargs or {})
+        model = cls(**saved_kwargs)
+        model.load_state_dict(payload["model_state_dict"])
         return model

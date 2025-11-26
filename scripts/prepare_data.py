@@ -1,108 +1,137 @@
 """
-Prepare data from the provided feature matrix (deepakntr_bo_features.csv).
+Prepare data pipeline (upgraded):
 
-Assumptions:
- - Input file: data/processed/deepakntr_bo_features.csv
- - Column 'Date' exists and is parseable as datetime
- - Column 'Close' exists (we predict next-day Close)
-
-Outputs:
- - data/processed/X_seq.npy        (3D: samples, seq_len, features)
- - data/processed/y_seq.npy        (1D: samples -> next-day Close)
- - data/processed/X_tab.npy        (2D: rows aligned with original rows, features only)
- - models/*/scalers/feature_scaler.joblib
+1. Loads raw brent + merged_macro
+2. Builds rich features via forecast.data.features.build_features
+3. Saves canonical features CSV: data/processed/brent_features.csv
+4. Builds sequences (X_seq, y_seq) where target = log(close_next)
+5. Builds tabular features (X_tab, y_tab)
+6. Fits FeatureScaler instances and saves them
+7. Saves feature_cols.npy and processed arrays used by training
 """
-import os
+
+import pandas as pd
+import numpy as np
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-
+from forecast.data.load_raw import load_raw_csv
+from forecast.data.preprocess import preprocess
+from forecast.data.features import build_features
 from forecast.data.scalers import FeatureScaler
 
-SEQ_LEN = 120
-INPUT_PATH = Path("data/processed/deepakntr_bo_features.csv")
+PROCESSED_DIR = Path("data/processed")
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+FEATURE_CSV_OUT = PROCESSED_DIR / "brent_features.csv"
+FEATURE_COLS_PATH = PROCESSED_DIR / "feature_cols.npy"
+
+SEQ_LEN = 60  # keep consistent with config/base.yaml
 
 
 def main():
-    if not INPUT_PATH.exists():
-        raise FileNotFoundError(f"Feature matrix not found: {INPUT_PATH}")
+    print("Loading raw data...")
+    price = load_raw_csv("data/raw/brent.csv")
+    macro = load_raw_csv("data/raw/merged_macro.csv")
 
-    print(f"Loading feature matrix from: {INPUT_PATH}")
-    df = pd.read_csv(INPUT_PATH)
-    # ensure Date is datetime and sorted
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.sort_values("Date").reset_index(drop=True)
+    # lowercase columns
+    price.columns = [c.lower() for c in price.columns]
+    macro.columns = [c.lower() for c in macro.columns]
 
-    # Ensure Close exists
-    if "Close" not in df.columns:
-        raise KeyError("Column 'Close' not found in feature matrix.")
+    price = preprocess(price)
+    macro = preprocess(macro)
 
-    # Build target = next-day Close
-    df = df.copy()
-    df["target_close"] = df["Close"].shift(-1)
+    print("Merging price + macro...")
+    df = price.merge(macro, on="date", how="left").sort_values("date").reset_index(drop=True)
 
-    # Drop final row which has no target
-    df = df.dropna(subset=["target_close"]).reset_index(drop=True)
+    print("Building rich feature matrix (this may take a few seconds)...")
+    df_features = build_features(df, price_col="brent_close" if "brent_close" in df.columns else "close")
 
-    # Keep feature columns (exclude Date and any target columns)
-    exclude_cols = {"Date", "target_close"}
-    feature_cols = [c for c in df.columns if c not in exclude_cols]
+    # Save canonical features CSV so inference & audit use the identical matrix
+    df_features.to_csv(FEATURE_CSV_OUT, index=False)
+    print(f"Saved feature CSV: {FEATURE_CSV_OUT}")
 
-    print(f"Using {len(feature_cols)} feature columns.")
-    X_tab = df[feature_cols].values.astype(float)  # shape (N, F)
-    # --- LightGBM y target (no sequence shifting needed because we already aligned target_return or Close.shift(-1))
-    y_tab = df["target_return"].values.astype(np.float32)
+    # Ensure log-close and next-day log target exist
+    if "brent_close" in df_features.columns:
+        df_features["close"] = df_features["brent_close"]
+    if "close" not in df_features.columns:
+        raise KeyError("Feature matrix missing 'close' price column for brent.")
 
-    np.save("data/processed/y_tab.npy", y_tab)
-    print("Saved y_tab.npy for LightGBM")
+    df_features["log_close"] = np.log(df_features["close"].astype(float))
+    df_features["log_close_next"] = df_features["log_close"].shift(-1)
+    # drop last row where next is NaN
+    df_features = df_features.dropna(subset=["log_close_next"]).reset_index(drop=True)
 
 
-    y = df["target_close"].values.astype(float)    # shape (N,)
+    # ----------------------------------------
+    # SANITIZE FEATURE MATRIX (CRITICAL)
+    # ----------------------------------------
 
-    # Build sequences for DL models: X_seq shape (samples, seq_len, features)
-    N = len(df)
+    # Convert INF → NaN
+    df_features = df_features.replace([np.inf, -np.inf], np.nan)
+
+    # Forward fill and backfill remaining holes
+    df_features = df_features.fillna(method="ffill").fillna(method="bfill")
+
+    # Replace still remaining NaN (rare) with 0
+    df_features = df_features.fillna(0)
+
+    # Clip extreme values to prevent float32 overflow
+    # Clip only numeric columns (avoid date column)
+    num_cols = df_features.select_dtypes(include=[np.number]).columns
+    df_features[num_cols] = df_features[num_cols].clip(lower=-1e6, upper=1e6)
+
+
+
+
+
+    # determine feature columns (exclude date, close, log_close, log_close_next)
+    exclude = {"date", "close", "log_close", "log_close_next"}
+    feature_cols = [c for c in df_features.columns if c not in exclude]
+    print(f"Number of feature columns: {len(feature_cols)}")
+    np.save(FEATURE_COLS_PATH, np.array(feature_cols, dtype=object))
+    print(f"Saved feature order to {FEATURE_COLS_PATH}")
+
+    # Build tabular arrays (LightGBM)
+    X_tab = df_features[feature_cols].values.astype(np.float32)
+    y_tab = df_features["log_close_next"].values.astype(np.float32)
+
+    # Build sequential arrays for DL (X_seq aligned to predict log_close_next)
+    N = len(df_features)
     if N <= SEQ_LEN:
-        raise ValueError(f"Not enough rows ({N}) to build sequences with seq_len={SEQ_LEN}.")
+        raise ValueError(f"Not enough rows ({N}) for seq_len={SEQ_LEN}")
 
     X_seq = []
     y_seq = []
-    # sequence window: for sample i we take rows [i : i+seq_len), predict y at i+seq_len-1? 
-    # We want X that ends at t and predict Close at t+1. To do that we iterate up to:
-    for start in range(0, N - SEQ_LEN):
-        end = start + SEQ_LEN
-        X_seq.append(X_tab[start:end])
-        y_seq.append(y[end - 1])  # y at row end-1 corresponds to next-day close relative to last row? 
-        # Explanation: since y was constructed as Close.shift(-1), y[row] = Close[row+1].
-        # For sequence covering rows start..end-1, we want target Close at row end (which is y[end-1]).
-    X_seq = np.asarray(X_seq, dtype=np.float32)  # (samples, seq_len, features)
-    y_seq = np.asarray(y_seq, dtype=np.float32)  # (samples,)
+    for i in range(SEQ_LEN, N):
+        X_seq.append(df_features[feature_cols].iloc[i - SEQ_LEN:i].values.astype(np.float32))
+        y_seq.append(df_features["log_close_next"].iloc[i].astype(np.float32))
 
-    print(f"Built sequences: X_seq.shape={X_seq.shape}, y_seq.shape={y_seq.shape}")
+    X_seq = np.stack(X_seq).astype(np.float32)
+    y_seq = np.stack(y_seq).astype(np.float32)
 
-    # Fit scalers for LSTM/TCN (3D) and LightGBM (2D)
-    os.makedirs("models/lstm_attention/scalers", exist_ok=True)
-    os.makedirs("models/tcn/scalers", exist_ok=True)
-    os.makedirs("models/lightgbm/scalers", exist_ok=True)
+    print(f"Built X_seq: {X_seq.shape}, y_seq: {y_seq.shape}, X_tab: {X_tab.shape}")
 
-    lstm_scaler = FeatureScaler()
-    tcn_scaler = FeatureScaler()
-    lgbm_scaler = FeatureScaler()
+    # Fit scalers
+    seq_scaler = FeatureScaler()
+    tab_scaler = FeatureScaler()
 
-    X_lstm = lstm_scaler.fit_transform(X_seq.copy())
-    X_tcn = tcn_scaler.fit_transform(X_seq.copy())
-    X_lgbm = lgbm_scaler.fit_transform(X_tab.copy())
+    X_seq_scaled = seq_scaler.fit_transform(X_seq.copy())
+    X_tab_scaled = tab_scaler.fit_transform(X_tab.copy())
 
-    lstm_scaler.save("models/lstm_attention/scalers/feature_scaler.joblib")
-    tcn_scaler.save("models/tcn/scalers/feature_scaler.joblib")
-    lgbm_scaler.save("models/lightgbm/scalers/feature_scaler.joblib")
+    # Save scalers (ensure dirs)
+    Path("models/lstm_attention/scalers").mkdir(parents=True, exist_ok=True)
+    Path("models/tcn/scalers").mkdir(parents=True, exist_ok=True)
+    Path("models/lightgbm/scalers").mkdir(parents=True, exist_ok=True)
 
-    os.makedirs("data/processed", exist_ok=True)
-    np.save("data/processed/X_seq.npy", X_lstm)   # we'll use a single scaler file for both DL models
-    np.save("data/processed/y_seq.npy", y_seq)
-    np.save("data/processed/X_tab.npy", X_lgbm)
-    np.save("data/processed/feature_cols.npy", np.array(feature_cols, dtype=object))
+    seq_scaler.save("models/lstm_attention/scalers/feature_scaler.joblib")
+    seq_scaler.save("models/tcn/scalers/feature_scaler.joblib")
+    tab_scaler.save("models/lightgbm/scalers/feature_scaler.joblib")
+
+    # Save arrays
+    np.save(PROCESSED_DIR / "X_seq.npy", X_seq_scaled)
+    np.save(PROCESSED_DIR / "y_seq.npy", y_seq)
+    np.save(PROCESSED_DIR / "X_tab.npy", X_tab_scaled)
+    np.save(PROCESSED_DIR / "y_tab.npy", y_tab)
 
     print("Saved processed arrays and scalers.")
     print("Done.")

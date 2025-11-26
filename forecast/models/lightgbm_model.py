@@ -1,84 +1,47 @@
 """
-LightGBM wrapper for regression forecasting.
-Uses lightgbm's sklearn API for easy integration.
-
-Provides:
-- fit(X, y, X_val=None, y_val=None)
-- predict(X)
-- save(path)
-- load(path)
-
-Note: this wrapper does not perform GPU-specific operations inside LightGBM itself.
-To enable LightGBM GPU training, pass params with "device": "gpu" or "boosting_type":"gbdt" and "device": "gpu"
-(e.g. params['device'] = 'gpu').
+LightGBM wrapper that saves and loads Booster with joblib.
 """
-import os
+
+from pathlib import Path
+import json
 import joblib
-import numpy as np
-from typing import Optional, Dict
 import lightgbm as lgb
+import numpy as np
 
 
 class LightGBMWrapper:
-    def __init__(self, params: Optional[Dict] = None, num_boost_round: int = 1000, early_stopping_rounds: int = 50, seed: int = 42):
-        """
-        params: LightGBM parameters dict. Example:
-            {
-                'objective': 'regression',
-                'metric': 'rmse',
-                'learning_rate': 0.05,
-                'num_leaves': 31,
-                'device': 'gpu'   # optional: 'cpu' or 'gpu' (if compiled with GPU)
-            }
-        """
-        self.params = params or {"objective": "regression", "metric": "rmse"}
+    def __init__(self, params=None, num_boost_round: int = 1000, early_stopping_rounds: int = 50):
+        self.params = params or {}
         self.num_boost_round = num_boost_round
         self.early_stopping_rounds = early_stopping_rounds
-        self.seed = seed
-        self.model: Optional[lgb.Booster] = None
+        self.bst = None
 
-    def fit(self, X, Y, X_val=None, y_val=None, verbose=100):
-        lgb_train = lgb.Dataset(X, label=Y)
-
-        valid_sets = [lgb_train]
-        valid_names = ["train"]
-
+    def fit(self, X, y, X_val=None, y_val=None):
+        dtrain = lgb.Dataset(X, label=y)
+        valid_sets = None
         callbacks = []
-
-        # If validation data passed → enable early stopping callback
         if X_val is not None and y_val is not None:
-            lgb_valid = lgb.Dataset(X_val, label=y_val, reference=lgb_train)
-            valid_sets.append(lgb_valid)
-            valid_names.append("valid")
-            callbacks.append(lgb.early_stopping(stopping_rounds=self.early_stopping_rounds))
+            dvalid = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+            valid_sets = [dtrain, dvalid]
+            callbacks = [lgb.early_stopping(stopping_rounds=self.early_stopping_rounds), lgb.log_evaluation(period=100)]
+        self.bst = lgb.train(self.params, dtrain, num_boost_round=self.num_boost_round, valid_sets=valid_sets, valid_names=["train", "valid"] if valid_sets else None, callbacks=callbacks)
+        return self
 
-        # Log training metrics every N iterations
-        callbacks.append(lgb.log_evaluation(period=verbose))
-
-        # Train the model
-        self.model = lgb.train(
-            self.params,
-            lgb_train,
-            num_boost_round=self.num_boost_round,
-            valid_sets=valid_sets,
-            valid_names=valid_names,
-            callbacks=callbacks  # <── FIXED
-        )
-
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        if self.model is None:
-            raise RuntimeError("Model not trained. Call fit() first or load() a model.")
-        return self.model.predict(X, num_iteration=self.model.best_iteration)
+    def predict(self, X):
+        if self.bst is None:
+            raise ValueError("Model is not trained.")
+        return self.bst.predict(X, num_iteration=self.bst.best_iteration)
 
     def save(self, path: str):
-        # Save Booster object + params
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        joblib.dump({"params": self.params, "num_boost_round": self.num_boost_round, "model": self.model}, path)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        # Save booster model string + metadata
+        joblib.dump({"params": self.params, "num_boost_round": self.num_boost_round, "model_str": self.bst.model_to_string()}, path)
 
     @classmethod
     def load(cls, path: str):
-        obj = joblib.load(path)
-        wrapper = cls(params=obj.get("params"), num_boost_round=obj.get("num_boost_round", 1000))
-        wrapper.model = obj.get("model")
-        return wrapper
+        data = joblib.load(path)
+        obj = cls(params=data.get("params", {}), num_boost_round=data.get("num_boost_round", 1000))
+        model_str = data.get("model_str")
+        if model_str:
+            obj.bst = lgb.Booster(model_str=model_str)
+        return obj

@@ -1,8 +1,13 @@
 # Forecast configuration
 
-seq_len: 60
+seq_len: 120
 
 paths:
+  # default feature csv used by inference/prepare_data scripts.
+  # KEEP the same filename if you want (deepakntr_bo_features.csv),
+  # or replace the file contents with Brent data and keep the filename unchanged.
+  feature_csv: "data/processed/brent_features.csv"
+
   scaler_lstm: "models/lstm_attention/scalers/feature_scaler.joblib"
   scaler_tcn: "models/tcn/scalers/feature_scaler.joblib"
   scaler_lgbm: "models/lightgbm/scalers/feature_scaler.joblib"
