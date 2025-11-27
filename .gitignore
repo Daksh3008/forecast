@@ -14,14 +14,10 @@ logs/
 *.log
 
 # Data
-data/raw/*
-data/interim/*
-!data/raw/.gitkeep
-!data/interim/.gitkeep
-data/processed/X_seq.npy
-data/processed/y_seq.npy
-data/processed/X_tab.npy
-data/processed/y_tab.npy    
+data/processed/
+data/interim/
+data/raw/
+
 
 # Models
 models/**/checkpoints/*
@@ -29,6 +25,9 @@ models/**/scalers/*
 models/**/lightgbm/*
 models/**/tcn/*
 models/**/lstm_attention/*
+models/*/scalers/
+models/*/checkpoints/
+forecasts/
 
 # PyTorch
 *.pt
